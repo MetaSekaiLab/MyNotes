@@ -15,6 +15,9 @@ public sealed class PlayerRecord
     public string InitialDataGroup { get; init; } = "";
     public long FavoriteMemberCardId { get; set; }
     public byte[] LiveSettingAll { get; set; } = [];
+    internal object LiveStateLock { get; } = new();
+    internal (long MusicId, int Difficulty)? ActiveFreeLive { get; set; }
+    internal Dictionary<(long MusicId, int Difficulty), LiveScore> LiveScores { get; } = [];
     internal object DeckStateLock { get; } = new();
     internal Dictionary<int, Deck> DeckOverrides { get; } = [];
     internal int MainDeckOverride { get; set; }

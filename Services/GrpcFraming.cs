@@ -1,35 +1,72 @@
 using System.Buffers.Binary;
 using Microsoft.AspNetCore.Http.Features;
+using Microsoft.Net.Http.Headers;
 
 namespace MyNotes.Services;
 
 public readonly record struct GrpcFrame(bool Compressed, ReadOnlyMemory<byte> Payload);
 
+public sealed class GrpcFrameException(string status, string message) : Exception(message)
+{
+    public string Status { get; } = status;
+}
+
 public static class GrpcFraming
 {
     public const string ContentType = "application/grpc";
+    public const int MaxMessageLength = 16 * 1024 * 1024;
 
-    public static bool IsGrpcRequest(HttpRequest request) =>
-        request.ContentType?.StartsWith("application/grpc", StringComparison.OrdinalIgnoreCase) == true;
+    public static bool IsGrpcRequest(HttpRequest request)
+    {
+        if (!MediaTypeHeaderValue.TryParse(request.ContentType, out var contentType) ||
+            contentType.Parameters.Any(parameter => parameter.Value.Length == 0))
+            return false;
+
+        var mediaType = contentType.MediaType.Value;
+        return string.Equals(mediaType, ContentType, StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(mediaType, ContentType + "+proto", StringComparison.OrdinalIgnoreCase);
+    }
 
     public static async Task<GrpcFrame> ReadRequestAsync(HttpRequest request, CancellationToken cancellationToken)
     {
-        using var memory = new MemoryStream();
-        await request.Body.CopyToAsync(memory, cancellationToken);
-        var data = memory.ToArray();
+        if (request.ContentLength > MaxMessageLength + 5L)
+            throw new GrpcFrameException("8", "grpc message exceeds the size limit");
 
-        if (data.Length == 0)
-            return new GrpcFrame(false, ReadOnlyMemory<byte>.Empty);
+        var prefix = new byte[5];
+        try
+        {
+            await request.Body.ReadExactlyAsync(prefix, cancellationToken);
+        }
+        catch (EndOfStreamException)
+        {
+            throw new GrpcFrameException("3", "grpc request requires a complete frame header");
+        }
 
-        if (data.Length < 5)
-            throw new InvalidDataException("Invalid gRPC frame: shorter than 5 bytes.");
+        if (prefix[0] is not (0 or 1))
+            throw new GrpcFrameException("3", "invalid grpc compression flag");
 
-        var compressed = data[0] != 0;
-        var length = BinaryPrimitives.ReadUInt32BigEndian(data.AsSpan(1, 4));
-        if (length > data.Length - 5)
-            throw new InvalidDataException("Invalid gRPC frame: length exceeds body size.");
+        var length = BinaryPrimitives.ReadUInt32BigEndian(prefix.AsSpan(1, 4));
+        if (length > MaxMessageLength)
+            throw new GrpcFrameException("8", "grpc message exceeds the size limit");
 
-        return new GrpcFrame(compressed, data.AsMemory(5, (int)length));
+        if (request.ContentLength.HasValue && request.ContentLength.Value != length + 5L)
+            throw new GrpcFrameException("3", "grpc frame length must match the request body");
+
+        var payload = new byte[(int)length];
+        try
+        {
+            await request.Body.ReadExactlyAsync(payload, cancellationToken);
+        }
+        catch (EndOfStreamException)
+        {
+            throw new GrpcFrameException("3", "grpc frame payload is incomplete");
+        }
+
+        var trailingByte = new byte[1];
+        if (await request.Body.ReadAsync(trailingByte, cancellationToken) != 0)
+            throw new GrpcFrameException("3", "unary grpc requests require exactly one frame");
+
+        return new GrpcFrame(prefix[0] == 1, payload);
     }
 
     public static async Task WriteResponseAsync(HttpContext context, byte[] protobuf)
@@ -55,6 +92,7 @@ public static class GrpcFraming
 
     public static async Task WriteErrorAsync(HttpContext context, string status, string message)
     {
+        context.Response.StatusCode = StatusCodes.Status200OK;
         context.Response.ContentType = ContentType;
         if (context.Response.SupportsTrailers())
         {

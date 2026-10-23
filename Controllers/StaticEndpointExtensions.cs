@@ -11,6 +11,11 @@ public static class StaticEndpointExtensions
 
         MapAndroidAssetProxy(endpoints, "/asset/Android/{**assetPath}");
         MapAndroidAssetProxy(endpoints, "/Android/{**assetPath}");
+        endpoints.MapMethods("/master/{version}/{fileName}", [HttpMethods.Get, HttpMethods.Head],
+            (string version, string fileName, ResourceReleaseService release) =>
+                release.FindMaster(version, fileName) is { } path
+                    ? Results.File(path, "application/octet-stream", enableRangeProcessing: true)
+                    : Results.NotFound());
 
         return endpoints;
     }
@@ -23,10 +28,22 @@ public static class StaticEndpointExtensions
         endpoints.MapMethods(
             pattern,
             [HttpMethods.Get, HttpMethods.Head],
-            (HttpContext context, StaticAssetService assets, string assetPath) =>
-                assets.ProxyAndroidAssetAsync(
-                    context,
-                    assetPath,
-                    HttpMethods.IsHead(context.Request.Method)));
+            async (HttpContext context, StaticAssetService assets, ResourceReleaseService release, string assetPath) =>
+            {
+                if (release.FindAndroid(assetPath) is { } path)
+                    await Results.File(path, "application/octet-stream", enableRangeProcessing: true).ExecuteAsync(context);
+                else if (release.Enabled && IsCatalogMarker(assetPath))
+                    context.Response.StatusCode = StatusCodes.Status404NotFound;
+                else
+                    await assets.ProxyAndroidAssetAsync(context, assetPath, HttpMethods.IsHead(context.Request.Method));
+            });
+    }
+
+    private static bool IsCatalogMarker(string assetPath)
+    {
+        var name = assetPath.Split('/').Last();
+        return name.StartsWith("catalog", StringComparison.OrdinalIgnoreCase) &&
+            (name.EndsWith(".bin", StringComparison.OrdinalIgnoreCase) ||
+             name.EndsWith(".hash", StringComparison.OrdinalIgnoreCase) || !name.Contains('.'));
     }
 }

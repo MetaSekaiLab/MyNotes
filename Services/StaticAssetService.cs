@@ -32,6 +32,7 @@ public sealed class StaticAssetService
 
     private readonly ILogger<StaticAssetService> _logger;
     private readonly HttpClient _officialAssets;
+    private readonly string? _localRoot;
     private readonly string? _cacheRoot;
     private readonly ConcurrentDictionary<string, CacheLockEntry> _cacheLocks = new(StringComparer.OrdinalIgnoreCase);
 
@@ -42,6 +43,9 @@ public sealed class StaticAssetService
     {
         _logger = logger;
         _officialAssets = httpClientFactory.CreateClient("official-assets");
+        _localRoot = string.IsNullOrWhiteSpace(ServerConfig.StaticAssetLocalDirectory)
+            ? null
+            : Path.GetFullPath(ServerConfig.StaticAssetLocalDirectory, environment.ContentRootPath);
         _cacheRoot = ServerConfig.StaticAssetCacheEnabled
             ? ResolveCacheRoot(environment.ContentRootPath)
             : null;
@@ -60,28 +64,43 @@ public sealed class StaticAssetService
         }
 
         var officialAssetPath = $"Android/{normalizedPath}";
-        var cachePath = GetCachePath(officialAssetPath);
-        if (cachePath == null)
+        var localPath = _localRoot == null ? null : ResolveSafeFilePath(_localRoot, officialAssetPath);
+        if (localPath != null && File.Exists(localPath))
+        {
+            await ServeFileAsync(context, localPath);
+            return;
+        }
+
+        var cachePath = IsCatalogMarker(normalizedPath) ? null : GetCachePath(officialAssetPath);
+        if (cachePath != null && File.Exists(cachePath))
+        {
+            await ServeFileAsync(context, cachePath);
+            return;
+        }
+
+        if (!ServerConfig.StaticAssetUpstreamEnabled)
+        {
+            context.Response.StatusCode = StatusCodes.Status404NotFound;
+            return;
+        }
+
+        if (cachePath == null || headOnly || context.Request.Headers.ContainsKey("Range"))
         {
             await ProxyOfficialAssetAsync(context, officialAssetPath, headOnly, null);
             return;
         }
 
-        if (File.Exists(cachePath))
-        {
-            await ServeCachedAssetAsync(context, cachePath);
-            return;
-        }
-
-        if (headOnly)
-        {
-            await ProxyOfficialAssetAsync(context, officialAssetPath, true, null);
-            return;
-        }
-
-        var cacheLock = await AcquireCacheLockAsync(cachePath, context.RequestAborted);
+        var cacheLockPath = cachePath;
+        var cacheLock = await AcquireCacheLockAsync(cacheLockPath, context.RequestAborted);
         try
         {
+            cachePath = GetCachePath(officialAssetPath);
+            if (cachePath == null)
+            {
+                await ProxyOfficialAssetAsync(context, officialAssetPath, false, null);
+                return;
+            }
+
             if (!File.Exists(cachePath))
             {
                 await ProxyOfficialAssetAsync(context, officialAssetPath, false, cachePath);
@@ -90,10 +109,10 @@ public sealed class StaticAssetService
         }
         finally
         {
-            ReleaseCacheLock(cachePath, cacheLock);
+            ReleaseCacheLock(cacheLockPath, cacheLock);
         }
 
-        await ServeCachedAssetAsync(context, cachePath);
+        await ServeFileAsync(context, cachePath);
     }
 
     private async Task ProxyOfficialAssetAsync(
@@ -105,14 +124,12 @@ public sealed class StaticAssetService
         var upstreamUrl = BuildOfficialAssetUrl(assetPath);
         if (upstreamUrl == null)
         {
-            context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
-            await context.Response.WriteAsync("official asset root is not configured", context.RequestAborted);
+            await WriteProxyErrorAsync(context, StatusCodes.Status503ServiceUnavailable,
+                "official asset root is not configured", headOnly);
             return;
         }
 
         _logger.LogInformation("Proxying asset {AssetPath} from {UpstreamUrl}", assetPath, upstreamUrl);
-
-        var populateCacheForRange = cachePath != null && context.Request.Headers.ContainsKey("Range");
 
         using var upstreamRequest = new HttpRequestMessage(headOnly ? HttpMethod.Head : HttpMethod.Get, upstreamUrl);
         if (ServerConfig.HasBasicAuth)
@@ -120,61 +137,19 @@ public sealed class StaticAssetService
         upstreamRequest.Headers.TryAddWithoutValidation("User-Agent", "MyNotes/1.0");
         upstreamRequest.Headers.AcceptEncoding.Add(new StringWithQualityHeaderValue("identity"));
 
-        if (!populateCacheForRange && context.Request.Headers.TryGetValue("Range", out var range))
+        if (context.Request.Headers.TryGetValue("Range", out var range))
             upstreamRequest.Headers.TryAddWithoutValidation("Range", range.ToString());
+        if (context.Request.Headers.TryGetValue("If-Range", out var ifRange))
+            upstreamRequest.Headers.TryAddWithoutValidation("If-Range", ifRange.ToString());
 
-        HttpResponseMessage upstreamResponse;
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted);
+        timeout.CancelAfter(TimeSpan.FromSeconds(ServerConfig.OfficialAssetRequestTimeoutSeconds));
         try
         {
-            upstreamResponse = await _officialAssets.SendAsync(
+            using var upstreamResponse = await _officialAssets.SendAsync(
                 upstreamRequest,
                 HttpCompletionOption.ResponseHeadersRead,
-                context.RequestAborted);
-        }
-        catch (TaskCanceledException) when (!context.RequestAborted.IsCancellationRequested)
-        {
-            _logger.LogWarning("Official asset proxy timed out for {UpstreamUrl}", upstreamUrl);
-            context.Response.StatusCode = StatusCodes.Status504GatewayTimeout;
-            await context.Response.WriteAsync("official asset upstream timed out", context.RequestAborted);
-            return;
-        }
-        catch (HttpRequestException ex)
-        {
-            _logger.LogWarning(ex, "Official asset proxy failed for {UpstreamUrl}", upstreamUrl);
-            context.Response.StatusCode = StatusCodes.Status502BadGateway;
-            await context.Response.WriteAsync("official asset upstream failed", context.RequestAborted);
-            return;
-        }
-
-        using (upstreamResponse)
-        {
-            if (populateCacheForRange && IsCacheable(upstreamResponse))
-            {
-                var upstreamBody = await upstreamResponse.Content.ReadAsStreamAsync(context.RequestAborted);
-                if (await CopyAndCacheAsync(
-                        upstreamBody,
-                        null,
-                        cachePath!,
-                        upstreamResponse.Content.Headers.ContentLength,
-                        context.RequestAborted))
-                {
-                    await ServeCachedAssetAsync(context, cachePath!);
-                    return;
-                }
-
-                _logger.LogWarning(
-                    "Could not populate cache before range response for {AssetPath}; falling back to direct proxy",
-                    assetPath);
-                await ProxyOfficialAssetAsync(context, assetPath, false, null);
-                return;
-            }
-
-            if (populateCacheForRange && upstreamResponse.IsSuccessStatusCode)
-            {
-                upstreamResponse.Dispose();
-                await ProxyOfficialAssetAsync(context, assetPath, false, null);
-                return;
-            }
+                timeout.Token);
 
             context.Response.StatusCode = (int)upstreamResponse.StatusCode;
             context.Response.Headers["X-Accel-Buffering"] = "no";
@@ -190,7 +165,7 @@ public sealed class StaticAssetService
 
             if (!headOnly)
             {
-                var upstreamBody = await upstreamResponse.Content.ReadAsStreamAsync(context.RequestAborted);
+                var upstreamBody = await upstreamResponse.Content.ReadAsStreamAsync(timeout.Token);
                 if (cachePath != null && IsCacheable(upstreamResponse))
                 {
                     if (await CopyAndCacheAsync(
@@ -198,30 +173,60 @@ public sealed class StaticAssetService
                             context.Response.Body,
                             cachePath,
                             upstreamResponse.Content.Headers.ContentLength,
-                            context.RequestAborted))
+                            timeout.Token))
                     {
                         _logger.LogInformation("Cached static asset at {CachePath}", cachePath);
                     }
                 }
                 else
                 {
-                    await upstreamBody.CopyToAsync(context.Response.Body, context.RequestAborted);
+                    await upstreamBody.CopyToAsync(context.Response.Body, timeout.Token);
                 }
             }
         }
+        catch (Exception ex) when (!context.RequestAborted.IsCancellationRequested &&
+            (ex is OperationCanceledException ||
+             timeout.IsCancellationRequested && (ex is HttpRequestException or IOException)))
+        {
+            _logger.LogWarning("Official asset proxy timed out for {UpstreamUrl}", upstreamUrl);
+            await WriteProxyErrorAsync(context, StatusCodes.Status504GatewayTimeout,
+                "official asset upstream timed out", headOnly);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or IOException)
+        {
+            _logger.LogWarning(ex, "Official asset proxy failed for {UpstreamUrl}", upstreamUrl);
+            await WriteProxyErrorAsync(context, StatusCodes.Status502BadGateway,
+                "official asset upstream failed", headOnly);
+        }
     }
 
-    private async Task ServeCachedAssetAsync(HttpContext context, string cachePath)
+    private async Task ServeFileAsync(HttpContext context, string filePath)
     {
-        if (!ContentTypes.TryGetContentType(cachePath, out var contentType))
+        if (!ContentTypes.TryGetContentType(filePath, out var contentType))
             contentType = "application/octet-stream";
 
-        _logger.LogInformation("Serving static asset from cache {CachePath}", cachePath);
+        _logger.LogInformation("Serving static asset from file {FilePath}", filePath);
         await Results.File(
-                cachePath,
+                filePath,
                 contentType,
+                lastModified: File.GetLastWriteTimeUtc(filePath),
                 enableRangeProcessing: true)
             .ExecuteAsync(context);
+    }
+
+    private static async Task WriteProxyErrorAsync(
+        HttpContext context, int statusCode, string message, bool headOnly)
+    {
+        if (context.Response.HasStarted)
+        {
+            context.Abort();
+            return;
+        }
+
+        context.Response.Clear();
+        context.Response.StatusCode = statusCode;
+        if (!headOnly)
+            await context.Response.WriteAsync(message, context.RequestAborted);
     }
 
     private async Task<bool> CopyAndCacheAsync(
@@ -383,31 +388,58 @@ public sealed class StaticAssetService
         if (_cacheRoot == null)
             return null;
 
-        var segments = assetPath.Split('/', StringSplitOptions.RemoveEmptyEntries);
-        if (segments.Length == 0 || segments.Any(static segment => !IsCacheableFileName(segment)))
-        {
-            _logger.LogWarning("Static asset path cannot be represented safely in the cache: {AssetPath}", assetPath);
-            return null;
-        }
+        return ResolveSafeFilePath(_cacheRoot, $"asset/{assetPath}");
+    }
 
+    private string? ResolveSafeFilePath(string root, string assetPath)
+    {
         try
         {
-            var relativePath = Path.Combine(["asset", .. segments]);
-            var cachePath = Path.GetFullPath(Path.Combine(_cacheRoot, relativePath));
-            var relativeToRoot = Path.GetRelativePath(_cacheRoot, cachePath);
+            var segments = assetPath.Split('/');
+            if (segments.Length == 0 || segments.Any(static segment => !IsCacheableFileName(segment)))
+                return null;
+
+            var fullPath = Path.GetFullPath(Path.Combine(root, Path.Combine(segments)));
+            var relativeToRoot = Path.GetRelativePath(root, fullPath);
             if (Path.IsPathFullyQualified(relativeToRoot) ||
                 relativeToRoot == ".." ||
                 relativeToRoot.StartsWith($"..{Path.DirectorySeparatorChar}", StringComparison.Ordinal))
             {
-                _logger.LogWarning("Static asset cache path escaped its configured root: {AssetPath}", assetPath);
+                _logger.LogWarning("Static asset path escaped its configured root: {AssetPath}", assetPath);
                 return null;
             }
 
-            return cachePath;
+            var currentPath = root;
+            for (var ancestor = new DirectoryInfo(root); ancestor != null; ancestor = ancestor.Parent)
+                if (ancestor.Exists && (ancestor.Attributes & FileAttributes.ReparsePoint) != 0)
+                    return null;
+            foreach (var segment in new[] { "" }.Concat(segments))
+            {
+                if (segment.Length > 0)
+                    currentPath = Path.Combine(currentPath, segment);
+
+                FileAttributes attributes;
+                try
+                {
+                    attributes = File.GetAttributes(currentPath);
+                }
+                catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+                {
+                    break;
+                }
+
+                if ((attributes & FileAttributes.ReparsePoint) != 0)
+                {
+                    _logger.LogWarning("Static asset path contains a symbolic link: {AssetPath}", assetPath);
+                    return null;
+                }
+            }
+
+            return fullPath;
         }
         catch (Exception ex) when (IsCacheStorageException(ex) || ex is ArgumentException)
         {
-            _logger.LogWarning(ex, "Could not resolve static asset cache path for {AssetPath}", assetPath);
+            _logger.LogWarning(ex, "Could not resolve static asset path for {AssetPath}", assetPath);
             return null;
         }
     }
@@ -474,12 +506,22 @@ public sealed class StaticAssetService
     {
         var normalizedPath = assetPath.Replace('\\', '/');
         var segments = normalizedPath.Split('/', StringSplitOptions.RemoveEmptyEntries);
-        if (Path.IsPathFullyQualified(normalizedPath) ||
+        if (normalizedPath.StartsWith('/') ||
+            Path.IsPathRooted(normalizedPath) ||
             segments.Length == 0 ||
-            segments.Any(static s => s is "." or ".."))
+            segments.Any(static s => s is "." or ".." || !IsCacheableFileName(s)))
             return null;
 
         return string.Join('/', segments);
+    }
+
+    private static bool IsCatalogMarker(string assetPath)
+    {
+        var fileName = assetPath[(assetPath.LastIndexOf('/') + 1)..];
+        return fileName.StartsWith("catalog", StringComparison.OrdinalIgnoreCase) &&
+            (!fileName.Contains('.') ||
+             fileName.EndsWith(".bin", StringComparison.OrdinalIgnoreCase) ||
+             fileName.EndsWith(".hash", StringComparison.OrdinalIgnoreCase));
     }
 
     private static Uri? BuildOfficialAssetUrl(string assetPath)

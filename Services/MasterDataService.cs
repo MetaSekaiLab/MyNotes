@@ -8,16 +8,19 @@ public sealed class MasterDataService
     private readonly ILogger<MasterDataService> _logger;
     private readonly Dictionary<string, InitialPlayerData> _initialDataByGroup;
 
-    public string Version => ServerConfig.MasterVersion;
+    public string Version { get; }
+    public string ResourceVersion { get; }
     public IReadOnlyList<long> DefaultUnlockedLiveMusicIds { get; }
     public IReadOnlyList<LiveScoreSeed> LiveScoreSeeds { get; }
     public IReadOnlyList<int> LiveComboRewardDifficulties { get; }
 
-    public MasterDataService(IHostEnvironment environment, ILogger<MasterDataService> logger)
+    public MasterDataService(IHostEnvironment environment, ILogger<MasterDataService> logger, ResourceReleaseService release)
     {
         _logger = logger;
+        Version = release.MasterVersion;
+        ResourceVersion = release.ResourceVersion;
 
-        var masterDirectory = ResolveMasterDirectory(environment.ContentRootPath);
+        var masterDirectory = release.MasterJsonDirectory ?? ResolveMasterDirectory(environment.ContentRootPath);
         if (masterDirectory == null)
         {
             _logger.LogWarning("Master data directory was not found; using baked fallback ids.");
@@ -58,10 +61,7 @@ public sealed class MasterDataService
     {
         var candidates = new[]
         {
-            Path.Combine(contentRootPath, ServerConfig.DataDirectory, "master"),
-            Path.Combine(contentRootPath, "data", "master"),
-            Path.GetFullPath(Path.Combine(contentRootPath, "..", "tmp", "master_dec")),
-            Path.GetFullPath(Path.Combine(contentRootPath, "tmp", "master_dec"))
+            Path.Combine(contentRootPath, ServerConfig.DataDirectory, "master")
         };
 
         return candidates.FirstOrDefault(path =>
@@ -142,11 +142,12 @@ public sealed class MasterDataService
                 }
             }
 
-            if (members.Count > 0 && supports.Count > 0)
-                result[groupRows.Key] = new InitialPlayerData(members, supports, decks);
+            result[groupRows.Key] = new InitialPlayerData(members, supports, decks);
         }
 
-        return result.Count > 0 ? result : BuildFallbackInitialData();
+        if (result.Count == 0)
+            result["Default"] = new InitialPlayerData([], [], []);
+        return result;
     }
 
     private static IReadOnlyList<long> LoadLiveMusicIds(string masterDirectory)
@@ -159,24 +160,31 @@ public sealed class MasterDataService
             .Order()
             .ToArray();
 
-        return ids.Length > 0 ? ids : FallbackLiveMusicIds;
+        return ids;
     }
 
     private static IReadOnlyList<LiveScoreSeed> LoadLiveScoreSeeds(string masterDirectory)
     {
         var liveMusicIds = LoadLiveMusicIds(masterDirectory).ToHashSet();
-        var seeds = ReadRows(Path.Combine(masterDirectory, "MasterLiveMusicScore.json"))
-            .Select(row => GetLong(row, "_id"))
-            .Where(id => id > 0)
-            .Select(id => new LiveScoreSeed(id / 100, ToServerDifficulty((int)(id % 100))))
-            .Where(seed => liveMusicIds.Contains(seed.MusicId))
-            .Where(seed => seed.Difficulty > 0)
-            .Distinct()
-            .OrderBy(seed => seed.MusicId)
-            .ThenBy(seed => seed.Difficulty)
-            .ToArray();
-
-        return seeds.Length > 0 ? seeds : FallbackLiveScoreSeeds;
+        var scores = ReadRows(Path.Combine(masterDirectory, "MasterLiveMusicScore.json"))
+            .Select(row => GetLong(row, "_id")).Where(id => id > 0).ToHashSet();
+        var seeds = new List<LiveScoreSeed>();
+        var fields = new[] { "_easyID", "_normalID", "_hardID", "_expertID" };
+        foreach (var music in ReadRows(Path.Combine(masterDirectory, "MasterLiveMusic.json")))
+        {
+            var id = GetLong(music, "_id");
+            if (!liveMusicIds.Contains(id))
+                continue;
+            for (var index = 0; index < fields.Length; index++)
+            {
+                var scoreId = GetLong(music, fields[index]);
+                if (scoreId > 0 && !scores.Contains(scoreId))
+                    throw new InvalidDataException("song references a missing score");
+                if (scoreId > 0)
+                    seeds.Add(new LiveScoreSeed(id, index + 1));
+            }
+        }
+        return seeds.Distinct().OrderBy(seed => seed.MusicId).ThenBy(seed => seed.Difficulty).ToArray();
     }
 
     private static IReadOnlyList<int> LoadComboRewardDifficulties(string masterDirectory)
@@ -189,7 +197,7 @@ public sealed class MasterDataService
             .Order()
             .ToArray();
 
-        return difficulties.Length > 0 ? difficulties : FallbackLiveDifficulties;
+        return difficulties;
     }
 
     private static HashSet<long> ReadIdSet(string masterDirectory, string fileName) =>

@@ -23,6 +23,7 @@ public sealed partial class VersionResponse : IMessage<global::App.Protobuf.Mast
     public VersionResponse(VersionResponse other) : this()
     {
         version_ = other.version_;
+        resourceVersion_ = other.resourceVersion_;
         _unknownFields = UnknownFieldSet.Clone(other._unknownFields);
     }
 
@@ -36,6 +37,14 @@ public sealed partial class VersionResponse : IMessage<global::App.Protobuf.Mast
         set => version_ = value ?? "";
     }
 
+    public const int ResourceVersionFieldNumber = 2;
+    private string resourceVersion_ = "";
+    public string ResourceVersion
+    {
+        get => resourceVersion_;
+        set => resourceVersion_ = value ?? "";
+    }
+
     public override bool Equals(object? other) => Equals(other as VersionResponse);
 
     public bool Equals(VersionResponse? other)
@@ -43,6 +52,7 @@ public sealed partial class VersionResponse : IMessage<global::App.Protobuf.Mast
         if (ReferenceEquals(other, null)) return false;
         if (ReferenceEquals(other, this)) return true;
         if (!Equals(Version, other.Version)) return false;
+        if (!Equals(ResourceVersion, other.ResourceVersion)) return false;
         return Equals(_unknownFields, other._unknownFields);
     }
 
@@ -50,6 +60,7 @@ public sealed partial class VersionResponse : IMessage<global::App.Protobuf.Mast
     {
         var hash = 1;
         if (Version.Length != 0) hash ^= Version.GetHashCode();
+        if (ResourceVersion.Length != 0) hash ^= ResourceVersion.GetHashCode();
         if (_unknownFields != null) hash ^= _unknownFields.GetHashCode();
         return hash;
     }
@@ -63,6 +74,11 @@ public sealed partial class VersionResponse : IMessage<global::App.Protobuf.Mast
             output.WriteRawTag(0x0A);
             output.WriteString(Version);
         }
+        if (ResourceVersion.Length != 0)
+        {
+            output.WriteRawTag(0x12);
+            output.WriteString(ResourceVersion);
+        }
         _unknownFields?.WriteTo(output);
     }
 
@@ -74,6 +90,8 @@ public sealed partial class VersionResponse : IMessage<global::App.Protobuf.Mast
             size += CodedOutputStream.ComputeTagSize(1);
             size += CodedOutputStream.ComputeStringSize(Version);
         }
+        if (ResourceVersion.Length != 0)
+            size += CodedOutputStream.ComputeTagSize(2) + CodedOutputStream.ComputeStringSize(ResourceVersion);
         if (_unknownFields != null) size += _unknownFields.CalculateSize();
         return size;
     }
@@ -82,6 +100,7 @@ public sealed partial class VersionResponse : IMessage<global::App.Protobuf.Mast
     {
         if (other == null) return;
         if (other.Version.Length != 0) Version = other.Version;
+        if (other.ResourceVersion.Length != 0) ResourceVersion = other.ResourceVersion;
         _unknownFields = UnknownFieldSet.MergeFrom(_unknownFields, other._unknownFields);
     }
 
@@ -94,6 +113,9 @@ public sealed partial class VersionResponse : IMessage<global::App.Protobuf.Mast
             {
                 case 10u:
                     Version = input.ReadString();
+                    break;
+                case 18u:
+                    ResourceVersion = input.ReadString();
                     break;
                 default:
                     _unknownFields = UnknownFieldSet.MergeFieldFrom(_unknownFields, input);
