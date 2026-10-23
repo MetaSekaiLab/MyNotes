@@ -8,12 +8,14 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="Google.Protobuf" Version="3.28.3" />
-    <PackageReference Include="MessagePack" Version="3.1.7" />
+    <Compile Remove="tests/**/*.cs" />
+    <Content Remove="tests/**;data/**" />
+    <None Remove="data/**" />
   </ItemGroup>
 
   <ItemGroup>
-    <Content Update="data\master\*.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <PackageReference Include="Google.Protobuf" Version="3.28.3" />
+    <PackageReference Include="MessagePack" Version="3.1.12" />
   </ItemGroup>
 
 </Project>

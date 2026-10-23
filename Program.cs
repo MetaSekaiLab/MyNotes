@@ -1,29 +1,82 @@
 using Google.Protobuf.WellKnownTypes;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
+using System.Security.Cryptography.X509Certificates;
+using System.Net.Security;
 using MyNotes.Controllers;
 using MyNotes.Config;
 using MyNotes.Middleware;
 using MyNotes.Services;
 using Protocol = App.Protobuf;
 
+if (args.FirstOrDefault() == "resource-release")
+{
+    if (args.Length != 7)
+        throw new ArgumentException("usage: resource-release BASELINE PACKAGE MASTER_JSON CATALOG_NAME RESOURCE_VERSION OUTPUT");
+    Console.WriteLine(ResourceReleaseBuilder.Build(args[1], args[2], args[3], args[4], args[5], args[6]));
+    return;
+}
+
 var builder = WebApplication.CreateBuilder(args);
+var configIndex = Array.IndexOf(args, "--config");
+if (configIndex >= 0)
+{
+    if (configIndex + 1 >= args.Length)
+        throw new ArgumentException("--config requires a JSON file path");
+    builder.Configuration.AddJsonFile(Path.GetFullPath(args[configIndex + 1]), optional: false, reloadOnChange: false)
+        .AddEnvironmentVariables().AddCommandLine(args);
+}
 
 builder.Logging.ClearProviders();
 builder.Logging.AddConsole();
 builder.Logging.AddDebug();
 
 ServerConfig.Load(builder.Configuration);
+X509Certificate2? serverCertificate = null;
+X509Certificate2Collection? serverCertificateChain = null;
+SslStreamCertificateContext? serverCertificateContext = null;
+if (!string.IsNullOrWhiteSpace(ServerConfig.CertificatePath))
+{
+    var certificates = X509CertificateLoader.LoadPkcs12CollectionFromFile(
+        Path.GetFullPath(ServerConfig.CertificatePath, builder.Environment.ContentRootPath),
+        ServerConfig.CertificatePassword);
+    serverCertificate = certificates.Cast<X509Certificate2>().First(certificate => certificate.HasPrivateKey);
+    serverCertificateChain = new X509Certificate2Collection();
+    foreach (var certificate in certificates)
+        if (!certificate.Equals(serverCertificate)) serverCertificateChain.Add(certificate);
+    var roots = new X509Certificate2Collection();
+    foreach (var certificate in serverCertificateChain)
+        if (certificate.SubjectName.RawData.AsSpan().SequenceEqual(certificate.IssuerName.RawData))
+            roots.Add(certificate);
+    serverCertificateContext = roots.Count == 0
+        ? SslStreamCertificateContext.Create(serverCertificate, serverCertificateChain, offline: true)
+        : SslStreamCertificateContext.Create(serverCertificate, serverCertificateChain, offline: true,
+            SslCertificateTrust.CreateForX509Collection(roots, sendTrustInHandshake: false));
+}
 
 builder.WebHost.ConfigureKestrel(options =>
 {
     options.ListenAnyIP(ServerConfig.GrpcPort, listen =>
     {
         listen.Protocols = HttpProtocols.Http2;
+        if (serverCertificate != null)
+            listen.UseHttps(https =>
+            {
+                https.ServerCertificate = serverCertificate;
+                https.ServerCertificateChain = serverCertificateChain;
+                https.OnAuthenticate = (_, options) => options.ServerCertificateContext = serverCertificateContext;
+            });
     });
 
     options.ListenAnyIP(ServerConfig.HttpPort, listen =>
     {
         listen.Protocols = HttpProtocols.Http1;
+        if (serverCertificate != null)
+            listen.UseHttps(https =>
+            {
+                https.ServerCertificate = serverCertificate;
+                https.ServerCertificateChain = serverCertificateChain;
+                https.OnAuthenticate = (_, options) => options.ServerCertificateContext = serverCertificateContext;
+            });
     });
 });
 
@@ -33,6 +86,7 @@ builder.Services.AddHttpClient("official-assets", client =>
 });
 
 builder.Services.AddSingleton<PlayerManager>();
+builder.Services.AddSingleton<ResourceReleaseService>();
 builder.Services.AddSingleton<MasterDataService>();
 builder.Services.AddSingleton<HomeSnapshotService>();
 builder.Services.AddSingleton<StaticAssetService>();
@@ -40,8 +94,14 @@ builder.Services.AddSingleton<MasterdataProtocolBuilder>();
 builder.Services.AddSingleton<PlayerProtocolBuilder>();
 builder.Services.AddSingleton<HomeProtocolBuilder>();
 builder.Services.AddSingleton<LiveProtocolBuilder>();
+builder.Services.AddSingleton<FreeLiveService>();
+builder.Services.AddSingleton<PlayerLoginService>();
+builder.Services.AddSingleton<FeatureSwitchService>();
 
 var app = builder.Build();
+_ = app.Services.GetRequiredService<MasterDataService>();
+_ = app.Services.GetRequiredService<PlayerLoginService>();
+_ = app.Services.GetRequiredService<FeatureSwitchService>();
 var appLogger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("MyNotes");
 
 app.Use(async (ctx, next) =>
@@ -60,21 +120,37 @@ app.UseExceptionHandler(handler => handler.Run(async ctx =>
     if (feature != null)
         appLogger.LogError(feature.Error, "Unhandled request error");
 
-    ctx.Response.StatusCode = StatusCodes.Status500InternalServerError;
     if (GrpcFraming.IsGrpcRequest(ctx.Request))
     {
-        ctx.Response.ContentType = GrpcFraming.ContentType;
-        ctx.Response.Headers.Append("grpc-status", "13");
-        ctx.Response.Headers.Append("grpc-message", "internal server error");
-        await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+        await GrpcFraming.WriteErrorAsync(ctx, "13", "internal server error");
         return;
     }
 
+    ctx.Response.StatusCode = StatusCodes.Status500InternalServerError;
     await ctx.Response.WriteAsJsonAsync(new { error = "Internal Server Error" });
 }));
 
 app.UseRouting();
 app.UseMiddleware<RequestLoggingScopeMiddleware>();
+
+app.MapGrpcUnary("/app.playerlogin.PlayerLoginService/GetServerList",
+    (ctx, payload) =>
+    {
+        _ = Empty.Parser.ParseFrom(payload.ToArray());
+        return Task.FromResult(ctx.RequestServices.GetRequiredService<PlayerLoginService>().ServerList());
+    });
+app.MapGrpcUnary("/app.playerlogin.PlayerLoginService/PlayerPreLogin",
+    (ctx, payload) => Task.FromResult(ctx.RequestServices.GetRequiredService<PlayerLoginService>().PreLogin(payload)));
+app.MapGrpcUnary("/app.playerlogin.PlayerLoginService/PlayerLogin",
+    (ctx, payload) => Task.FromResult(ctx.RequestServices.GetRequiredService<PlayerLoginService>().Login(payload)));
+
+app.MapGrpcUnary("/app.feature_switch.FeatureSwitchService/Get",
+    (ctx, payload) =>
+    {
+        _ = Empty.Parser.ParseFrom(payload.ToArray());
+        _ = ctx.RequestServices.GetRequiredService<PlayerManager>().GetFromRequest(ctx.Request);
+        return Task.FromResult(ctx.RequestServices.GetRequiredService<FeatureSwitchService>().Get());
+    });
 
 app.MapGrpcUnary(
     "/app.masterdata.MasterdataService/Version",
@@ -760,6 +836,37 @@ app.MapGrpcUnary(
     static (_, _) => Task.FromResult(new Protocol.Announcement.GetResponse()));
 
 app.MapGrpcUnary(
+    "/app.seasonpass.SeasonPassService/Fetch",
+    Protocol.SeasonPass.FetchRequest.Parser,
+    static (_, _) => Task.FromResult(new Protocol.SeasonPass.FetchResponse()));
+
+app.MapGrpcUnary(
+    "/app.playerext.PlayerExtService/SyncData",
+    Protocol.PlayerExt.SyncDataRequest.Parser,
+    (ctx, _) =>
+    {
+        var players = ctx.RequestServices.GetRequiredService<PlayerManager>();
+        var protocol = ctx.RequestServices.GetRequiredService<PlayerProtocolBuilder>();
+        var player = players.GetFromRequest(ctx.Request);
+        return Task.FromResult(protocol.SyncData(player));
+    });
+
+app.MapGrpcUnary(
+    "/app.chat.ClientChatService/SyncMsg",
+    Protocol.Chat.ClientSyncMsgRequest.Parser,
+    static (_, _) => Task.FromResult(new Protocol.Chat.ClientSyncMsgResponse()));
+
+app.MapGrpcUnary(
+    "/app.chat.ClientChatService/GetNotifications",
+    Protocol.Chat.GetNotificationsRequest.Parser,
+    static (_, _) => Task.FromResult(new Protocol.Chat.GetNotificationsResponse()));
+
+app.MapGrpcUnary(
+    "/app.live.LiveService/FetchBattleLiveInvitation",
+    Protocol.Live.FetchBattleLiveInvitationRequest.Parser,
+    static (_, _) => Task.FromResult(new Protocol.Live.FetchBattleLiveInvitationResponse()));
+
+app.MapGrpcUnary(
     "/app.carousel_help.CarouselHelpService/Shown",
     Protocol.CarouselHelp.ShownRequest.Parser,
     (ctx, request) =>
@@ -826,22 +933,29 @@ app.MapGrpcUnary(
 app.MapGrpcUnary(
     "/app.live.LiveService/StartFree",
     Protocol.Live.StartFreeRequest.Parser,
-    static (_, _) => Task.FromResult(new Protocol.Live.StartFreeResponse()));
+    (ctx, request) => Task.FromResult(ctx.RequestServices.GetRequiredService<FreeLiveService>()
+        .Start(ctx.RequestServices.GetRequiredService<PlayerManager>().GetFromRequest(ctx.Request), request)));
 
 app.MapGrpcUnary(
     "/app.live.LiveService/FinishFree",
     Protocol.Live.FinishFreeRequest.Parser,
-    static (_, _) => Task.FromResult(new Protocol.Live.FinishFreeResponse()));
+    (ctx, request) => Task.FromResult(ctx.RequestServices.GetRequiredService<FreeLiveService>()
+        .Finish(ctx.RequestServices.GetRequiredService<PlayerManager>().GetFromRequest(ctx.Request), request)));
 
-app.MapGrpcUnary(
+app.MapGrpcUnary<Protocol.Live.SkipFreeRequest, Protocol.Live.SkipFreeResponse>(
     "/app.live.LiveService/SkipFree",
     Protocol.Live.SkipFreeRequest.Parser,
-    static (_, _) => Task.FromResult(new Protocol.Live.SkipFreeResponse()));
+    static (_, _) => throw new GrpcStatusException("12", "live skipping is not supported"));
 
 app.MapGrpcUnary(
     "/app.live.LiveService/CheckMaintenanceCasualMatch",
     Protocol.Live.CheckMaintenanceCasualMatchRequest.Parser,
     static (_, _) => Task.FromResult(new Protocol.Live.CheckMaintenanceCasualMatchResponse()));
+
+app.MapGrpcUnary(
+    "/app.live.LiveService/CheckMaintenanceFree",
+    Protocol.Live.CheckMaintenanceFreeRequest.Parser,
+    static (_, _) => Task.FromResult(new Protocol.Live.CheckMaintenanceFreeResponse()));
 
 app.MapGrpcUnary(
     "/app.live.LiveService/CheckMaintenanceRankMatch",
@@ -959,12 +1073,23 @@ app.MapGrpcUnary(
 
 app.MapStaticAssetEndpoints();
 
+app.MapFallback(async context =>
+{
+    if (GrpcFraming.IsGrpcRequest(context.Request))
+        await GrpcFraming.WriteErrorAsync(context, "12", "rpc method is not supported");
+    else
+        context.Response.StatusCode = StatusCodes.Status404NotFound;
+});
+
 app.MapGet("/", () => Results.Json(new
 {
     name = "MyNotes",
     status = "ok"
 }));
 
-Console.WriteLine($"MyNotes gRPC h2c is running on port {ServerConfig.GrpcPort}");
-Console.WriteLine($"MyNotes HTTP static/admin is running on port {ServerConfig.HttpPort}");
+var scheme = serverCertificate == null ? "http" : "https";
+Console.WriteLine($"MyNotes gRPC HTTP/2 is running on {scheme} port {ServerConfig.GrpcPort}");
+Console.WriteLine($"MyNotes static/admin HTTP/1.1 is running on {scheme} port {ServerConfig.HttpPort}");
 app.Run();
+
+public partial class Program { }

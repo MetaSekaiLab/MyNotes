@@ -6,6 +6,7 @@ public sealed class MasterdataProtocolBuilder(MasterDataService masterData)
 {
     public VersionResponse Version() => new()
     {
-        Version = masterData.Version
+        Version = masterData.Version,
+        ResourceVersion = masterData.ResourceVersion
     };
 }

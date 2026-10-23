@@ -13,6 +13,7 @@ public sealed class HomeProtocolBuilder(PlayerManager players, PlayerProtocolBui
             Notification = snapshot.HasNotification ? new Notification() : null,
             Friends = snapshot.HasFriends ? playerProtocol.BuildFriends(player, players) : null
         };
+        ClientStateProtocol.InitializeHome(response);
 
         foreach (var invitation in players.GetInvitationProfiles(player))
         {

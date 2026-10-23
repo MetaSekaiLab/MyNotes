@@ -1,5 +1,6 @@
 using App.Protobuf.Entity;
 using App.Protobuf.Player;
+using App.Protobuf.PlayerExt;
 using Google.Protobuf;
 using MyNotes.Models;
 
@@ -43,8 +44,16 @@ public sealed class PlayerProtocolBuilder(MasterDataService master)
             }
         };
         response.Invitation.NewInvitationPlayerIds.Add(invitationState.NewPlayerIds);
+        ClientStateProtocol.SetAccountId(response, player.ProfileId);
         return response;
     }
+
+    public SyncDataResponse SyncData(PlayerRecord player) => new()
+    {
+        Accountid = player.ProfileId,
+        Gem = new Gem(),
+        LiveBoost = new LiveBoost()
+    };
 
     public PlayerSimpleProfile BuildSimpleProfile(PlayerRecord player)
     {
@@ -111,6 +120,7 @@ public sealed class PlayerProtocolBuilder(MasterDataService master)
             LiveStampReward = new LiveStampReward(),
             Comeback = new Comeback()
         };
+        ClientStateProtocol.InitializePlayer(data);
 
         if (player.CircleId != 0)
             data.CircleId = player.CircleId;
@@ -124,13 +134,13 @@ public sealed class PlayerProtocolBuilder(MasterDataService master)
         foreach (var deck in decks)
             data.Decks.Add(deck.Clone());
 
-        foreach (var score in master.LiveScoreSeeds)
+        lock (player.LiveStateLock)
         {
-            data.LiveScore.Add(new LiveScore
+            foreach (var score in master.LiveScoreSeeds)
             {
-                MusicId = score.MusicId,
-                Difficulty = score.Difficulty
-            });
+                data.LiveScore.Add(player.LiveScores.TryGetValue((score.MusicId, score.Difficulty), out var saved)
+                    ? saved.Clone() : new LiveScore { MusicId = score.MusicId, Difficulty = score.Difficulty });
+            }
         }
 
         foreach (var musicId in master.DefaultUnlockedLiveMusicIds)
@@ -265,7 +275,7 @@ public sealed class PlayerProtocolBuilder(MasterDataService master)
             var seed = initialData.MemberCards[(int)displayMemberCardId - 1];
             profile.FavoriteMemberCard = BuildDeckMemberCardDetail(seed);
             if (requestedMemberCardId > 0 && requestedMemberCardId <= initialData.MemberCards.Count)
-                profile.FavoriteMemberCardMasterId = requestedMemberCardId;
+                profile.FavoriteMemberCardMasterId = seed.MasterId;
         }
 
         return profile;

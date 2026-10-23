@@ -72,7 +72,7 @@ public sealed class PlayerManager(ILogger<PlayerManager> logger)
         if (TryGetFromRequest(request, out var player))
             return player;
 
-        return _playersById.Values.OrderBy(p => p.ProfileId).FirstOrDefault() ?? Register(ServerConfig.InitialDataGroup);
+        throw new UnauthorizedAccessException("Valid player credentials are required.");
     }
 
     public bool TryGetByProfileId(long profileId, out PlayerRecord player) =>
@@ -1045,23 +1045,39 @@ public sealed class PlayerManager(ILogger<PlayerManager> logger)
             player.ShownContentUnlockIds.Count);
     }
 
-    public bool IsKnownCredential(HttpRequest request)
-    {
-        if (TryGetFromRequest(request, out _))
-            return true;
-
-        if (!request.Headers.TryGetValue("authorization", out var value))
-            return true;
-
-        var authorization = value.ToString();
-        return string.IsNullOrWhiteSpace(authorization) || ServerConfig.IsExpectedBasicAuth(authorization);
-    }
+    public bool IsKnownCredential(HttpRequest request) => TryGetFromRequest(request, out _);
 
     private bool TryGetFromRequest(HttpRequest request, out PlayerRecord player)
     {
-        var authorization = ReadHeader(request, "authorization");
-        if (authorization != null && _playersByAuthorization.TryGetValue(StripBearerPrefix(authorization), out player!))
+        player = null!;
+        if (request.Headers.TryGetValue("x-player-credential", out var credentials))
+        {
+            if (credentials.Count != 1 || string.IsNullOrEmpty(credentials[0]) ||
+                !request.Headers.TryGetValue("x-player-id", out var ids) || ids.Count != 1 ||
+                !_playersByAuthorization.TryGetValue(credentials[0]!, out var authenticated) ||
+                !string.Equals(authenticated.PlayerId, ids[0], StringComparison.Ordinal))
+                return false;
+
+            if (request.Headers.TryGetValue("authorization", out var suppliedAuthorization) &&
+                (suppliedAuthorization.Count != 1 || string.IsNullOrWhiteSpace(suppliedAuthorization[0]) ||
+                 (!ServerConfig.IsExpectedBasicAuth(suppliedAuthorization[0]!) &&
+                  !string.Equals(StripBearerPrefix(suppliedAuthorization[0]!), authenticated.AuthorizationKey,
+                      StringComparison.Ordinal))))
+                return false;
+
+            player = authenticated;
             return true;
+        }
+
+        if (!request.Headers.TryGetValue("authorization", out var values) || values.Count != 1)
+            return false;
+
+        var authorization = values[0];
+        if (string.IsNullOrWhiteSpace(authorization))
+            return false;
+
+        if (!ServerConfig.IsExpectedBasicAuth(authorization))
+            return _playersByAuthorization.TryGetValue(StripBearerPrefix(authorization), out player!);
 
         var playerId = ReadHeader(request, "x-player-id")
             ?? ReadHeader(request, "player-id")
@@ -1074,7 +1090,6 @@ public sealed class PlayerManager(ILogger<PlayerManager> logger)
             return true;
         }
 
-        player = null!;
         return false;
     }
 
